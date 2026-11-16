@@ -1,3 +1,4 @@
+using Microsoft.EntityFrameworkCore;
 using Api.Features.Students;
 using Api.Features.Courses;
 using Api.Features.Admissions;
@@ -14,14 +15,14 @@ using Application.Features.Admissions.GetAdmissionById;
 using Domain.Common;
 using FluentValidation;
 using Infrastructure.Persistence;
-using Microsoft.EntityFrameworkCore;
 using Scalar.AspNetCore;
 
 var builder = WebApplication.CreateBuilder(args);
 
 // Database
 builder.Services.AddDbContext<IAppDbContext, AppDbContext>(options =>
-    options.UseInMemoryDatabase("VerticalSliceDb"));
+    options.UseSqlite(
+        builder.Configuration.GetConnectionString("Database")));
 
 // Validators
 builder.Services.AddValidatorsFromAssemblyContaining<CreateStudentValidator>();
