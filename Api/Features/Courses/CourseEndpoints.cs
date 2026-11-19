@@ -1,5 +1,6 @@
 namespace Api.Features.Courses;
 
+using Api.Common.Authorization;
 using Api.Common.Extensions;
 using Application.Abstractions.Messaging;
 using Application.Features.Courses.CreateCourse;
@@ -20,6 +21,7 @@ public static class CourseEndpoints
             .WithSummary("Get all courses");
 
         group.MapPost("/", Create)
+            .RequireAuthorization(Policies.CanManageCourses)
             .WithName("CreateCourse")
             .WithSummary("Create a new course");
 
