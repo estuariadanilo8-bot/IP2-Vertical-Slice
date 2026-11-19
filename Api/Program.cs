@@ -1,27 +1,36 @@
-using Application.Features.Auth.Login;
-using Application.Features.Auth.Register;
-using Api.Features.Auth;
-using Application.Abstractions;
-using Infrastructure.Authentication;
-using Microsoft.EntityFrameworkCore;
-using Api.Features.Students;
-using Api.Features.Courses;
+using System.Security.Claims;
+using System.Text;
+using Api.Common.Authorization;
 using Api.Features.Admissions;
+using Api.Features.Auth;
+using Api.Features.Courses;
+using Api.Features.Students;
+using Application.Abstractions;
 using Application.Abstractions.Data;
 using Application.Abstractions.Messaging;
-using Application.Features.Students.CreateStudent;
-using Application.Features.Students.GetAllStudents;
-using Application.Features.Students.GetStudentById;
+using Application.Features.Admissions.CreateAdmission;
+using Application.Features.Admissions.GetAdmissionById;
+using Application.Features.Auth.Login;
+using Application.Features.Auth.Register;
 using Application.Features.Courses.CreateCourse;
 using Application.Features.Courses.GetAllCourses;
 using Application.Features.Courses.GetCourseById;
-using Application.Features.Admissions.CreateAdmission;
-using Application.Features.Admissions.GetAdmissionById;
+using Application.Features.Students.CreateStudent;
+using Application.Features.Students.GetAllStudents;
+using Application.Features.Students.GetStudentById;
 using Domain.Common;
 using FluentValidation;
+using Infrastructure.Authentication;
+using Infrastructure.BackgroundJobs;
 using Infrastructure.Persistence;
+using Microsoft.AspNetCore.Authentication.JwtBearer;
+using Microsoft.AspNetCore.Authorization;
+using Microsoft.AspNetCore.Mvc;
+using Microsoft.EntityFrameworkCore;
+using Microsoft.IdentityModel.JsonWebTokens;
+using Microsoft.IdentityModel.Tokens;
+using Microsoft.OpenApi;
 using Scalar.AspNetCore;
-
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -29,7 +38,7 @@ builder.Services.AddOptions<JwtOptions>()
     .Bind(builder.Configuration.GetSection(JwtOptions.SectionName))
     .Validate(o => !string.IsNullOrWhiteSpace(o.SigningKey),
         "Jwt:SigningKey is required. Set it with: dotnet user-secrets set \"Jwt:SigningKey\" \"<value>\"")
-    .Validate(o => System.Text.Encoding.UTF8.GetByteCount(o.SigningKey ?? "") >= 32,
+    .Validate(o => Encoding.UTF8.GetByteCount(o.SigningKey ?? "") >= 32,
         "Jwt:SigningKey must be at least 256 bits (32 characters).")
     .ValidateOnStart();
 
@@ -44,7 +53,7 @@ builder.Services.AddDbContext<IAppDbContext, AppDbContext>(options =>
 // Validators
 builder.Services.AddValidatorsFromAssemblyContaining<CreateStudentValidator>();
 
-// Handlers
+// Handlers & Services
 builder.Services.AddScoped<ICommandHandler<CreateStudentCommand, Result<CreateStudentResponse>>, CreateStudentCommandHandler>();
 builder.Services.AddScoped<IQueryHandler<GetAllStudentsQuery, Result<GetAllStudentsResponse>>, GetAllStudentsQueryHandler>();
 builder.Services.AddScoped<IQueryHandler<GetStudentByIdQuery, Result<GetStudentByIdResponse>>, GetStudentByIdQueryHandler>();
@@ -53,12 +62,66 @@ builder.Services.AddScoped<IQueryHandler<GetAllCoursesQuery, Result<GetAllCourse
 builder.Services.AddScoped<IQueryHandler<GetCourseByIdQuery, Result<GetCourseByIdResponse>>, GetCourseByIdQueryHandler>();
 builder.Services.AddScoped<ICommandHandler<CreateAdmissionCommand, Result<CreateAdmissionResponse>>, CreateAdmissionCommandHandler>();
 builder.Services.AddScoped<IQueryHandler<GetAdmissionByIdQuery, Result<GetAdmissionByIdResponse>>, GetAdmissionByIdQueryHandler>();
-builder.Services.AddScoped<IPasswordHasher, Infrastructure.Authentication.PasswordHasher>();
+builder.Services.AddScoped<IPasswordHasher, PasswordHasher>();
 builder.Services.AddScoped<ICommandHandler<RegisterCommand, Result<RegisterResponse>>, RegisterCommandHandler>();
 builder.Services.AddScoped<ICommandHandler<LoginCommand, Result<LoginResponse>>, LoginCommandHandler>();
 
+// JWT Authentication & Revocation Checks
+var jwtSection = builder.Configuration.GetSection(JwtOptions.SectionName);
+builder.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
+    .AddJwtBearer(options =>
+    {
+        options.TokenValidationParameters = new TokenValidationParameters
+        {
+            ValidateIssuer = true,
+            ValidateAudience = true,
+            ValidateLifetime = true,
+            ValidateIssuerSigningKey = true,
+            ValidIssuer = jwtSection["Issuer"],
+            ValidAudience = jwtSection["Audience"],
+            IssuerSigningKey = new SymmetricSecurityKey(
+                Encoding.UTF8.GetBytes(jwtSection["SigningKey"]!)),
+            ClockSkew = TimeSpan.FromSeconds(30)
+        };
 
-// API
+        options.Events = new JwtBearerEvents
+        {
+            OnTokenValidated = async context =>
+            {
+                var dbContext = context.HttpContext.RequestServices
+                    .GetRequiredService<IAppDbContext>();
+
+                var jti = context.Principal?.FindFirstValue(JwtRegisteredClaimNames.Jti);
+                var sub = context.Principal?.FindFirstValue(JwtRegisteredClaimNames.Sub);
+                var iatRaw = context.Principal?.FindFirstValue(JwtRegisteredClaimNames.Iat);
+
+                if (jti is not null && await dbContext.RevokedTokens.AnyAsync(r => r.Jti == jti))
+                {
+                    context.Fail("Token has been revoked.");
+                    return;
+                }
+
+                if (sub is not null && Guid.TryParse(sub, out var userId) && iatRaw is not null
+                    && long.TryParse(iatRaw, out var iatUnix))
+                {
+                    var issuedAtUtc = DateTimeOffset.FromUnixTimeSeconds(iatUnix).UtcDateTime;
+                    var user = await dbContext.Users.FindAsync(userId);
+
+                    if (user?.TokensValidFromUtc is { } validFrom && issuedAtUtc < validFrom)
+                    {
+                        context.Fail("Token was issued before the user's last sign-out-everywhere.");
+                    }
+                }
+            }
+        };
+    });
+
+// Authorization & Background Services
+builder.Services.AddAppAuthorization();
+builder.Services.AddHostedService<RevokedTokenCleanupService>();
+builder.Services.AddSingleton<IAuthorizationHandler, AdmissionOwnerHandler>();
+
+// API & OpenAPI Configuration with Bearer Support
 builder.Services.AddEndpointsApiExplorer();
 builder.Services.AddOpenApi(options =>
 {
@@ -66,6 +129,20 @@ builder.Services.AddOpenApi(options =>
     {
         document.Info.Title = "Vertical Slice API";
         document.Info.Description = "A simple API demonstrating Vertical Slice Architecture";
+        document.Components ??= new OpenApiComponents();
+        document.Components.SecuritySchemes ??= new Dictionary<string, IOpenApiSecurityScheme>();
+        document.Components.SecuritySchemes["Bearer"] = new OpenApiSecurityScheme
+        {
+            Type = SecuritySchemeType.Http,
+            Scheme = "bearer",
+            BearerFormat = "JWT",
+            Description = "Paste the access token from /api/auth/login"
+        };
+        document.Security ??= [];
+        document.Security.Add(new OpenApiSecurityRequirement
+        {
+            [new OpenApiSecuritySchemeReference("Bearer", document)] = []
+        });
         return Task.CompletedTask;
     });
 });
@@ -75,12 +152,33 @@ var app = builder.Build();
 // Apply migrations and seed database
 await app.Services.MigrateAndSeedAsync();
 
+// Custom Problem Details for 401/403
+app.UseStatusCodePages(async context =>
+{
+    var response = context.HttpContext.Response;
+    if (response.StatusCode is StatusCodes.Status401Unauthorized or StatusCodes.Status403Forbidden)
+    {
+        response.ContentType = "application/problem+json";
+        await response.WriteAsJsonAsync(new ProblemDetails
+        {
+            Status = response.StatusCode,
+            Title = response.StatusCode == StatusCodes.Status401Unauthorized ? "Unauthorized" : "Forbidden",
+            Detail = response.StatusCode == StatusCodes.Status401Unauthorized
+                ? "Authentication is required to access this resource."
+                : "You do not have permission to perform this action."
+        });
+    }
+});
+
 // Configure the HTTP request pipeline
 if (app.Environment.IsDevelopment())
 {
     app.MapOpenApi();
     app.MapScalarApiReference();
 }
+
+app.UseAuthentication();
+app.UseAuthorization();
 
 // Root endpoint
 app.MapGet("/", () => "Welcome to the Vertical Slice API! Go to /scalar/v1 for API documentation.");

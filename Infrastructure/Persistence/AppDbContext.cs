@@ -13,9 +13,12 @@ public sealed class AppDbContext : DbContext, IAppDbContext
     public DbSet<Admission> Admissions => Set<Admission>();
     public DbSet<AdmissionCourse> AdmissionCourses => Set<AdmissionCourse>();
     public DbSet<ApplicationUser> Users => Set<ApplicationUser>();
+    public DbSet<RevokedToken> RevokedTokens => Set<RevokedToken>();
 
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {
+        base.OnModelCreating(modelBuilder);
+
         modelBuilder.Entity<Student>(entity =>
         {
             entity.HasKey(s => s.Id);
@@ -61,11 +64,16 @@ public sealed class AppDbContext : DbContext, IAppDbContext
             entity.Property(u => u.Role).IsRequired().HasConversion<int>();
             entity.HasIndex(u => u.Email).IsUnique();
 
-            
             entity.HasOne(u => u.Student)
                   .WithMany()
                   .HasForeignKey(u => u.StudentId)
                   .OnDelete(DeleteBehavior.SetNull);
+        });
+
+        modelBuilder.Entity<RevokedToken>(entity =>
+        {
+            entity.HasKey(r => r.Jti);
+            entity.Property(r => r.Jti).HasMaxLength(256);
         });
     }
 }
